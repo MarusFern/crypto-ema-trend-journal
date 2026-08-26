@@ -1,0 +1,45 @@
+{
+  "now_utc": "2026-08-26T12:00:00Z",
+  "account": {
+    "equity": 10000.0,
+    "last_equity": 10000.0,
+    "cash": 10000.0,
+    "buying_power": 10000.0
+  },
+  "daily_pnl_pct": 0.0,
+  "entries_today": 0,
+  "loss_exits_today": [],
+  "prior_decision_outcome": "prior run held both symbols; no fills since",
+  "prior_ema200": {
+    "BTC/USD": null,
+    "ETH/USD": null
+  },
+  "quotes": {
+    "BTC/USD": { "bid": 0, "ask": 0, "mid": 0 },
+    "ETH/USD": { "bid": 0, "ask": 0, "mid": 0 }
+  },
+  "positions": [
+    {
+      "symbol": "BTC/USD",
+      "qty": 0.0,
+      "original_qty": 0.0,
+      "avg_entry_price": 0.0,
+      "current_price": 0.0,
+      "market_value": 0.0,
+      "unrealized_pl": 0.0,
+      "entry_ts": null,
+      "scaled_out_pct": 0.0
+    }
+  ],
+  "open_orders": [
+    {
+      "id": "example-stop-id",
+      "symbol": "BTC/USD",
+      "side": "sell",
+      "type": "stop",
+      "stop_price": 0.0,
+      "qty": 0.0,
+      "status": "open"
+    }
+  ]
+}

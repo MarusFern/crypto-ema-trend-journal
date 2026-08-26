@@ -1,32 +1,61 @@
-# Crypto EMA Trend Hourly Paper — Trading Journal
+# Sonnet-ready EMA trend routine
 
-This repo is the persistent memory for the "Crypto EMA Trend Hourly Paper" cloud routine
-(Alpaca paper account #PA3X8XF6J20K). Each hourly run is a fresh, isolated cloud session
-with no memory of prior runs — this repo is how it reconstructs history and context.
+`strategy.py` owns every indicator, R reconstruction, size, and entry/exit boolean.
+The Claude Sonnet 5 routine only fetches Alpaca account/position/order state, runs the script, executes the returned actions, and journals.
+
+This is the refactor Claude recommended: bars never pass through the model.
 
 ## Files
 
-- `journal.jsonl` — one JSON object per line, appended every run. This is the append-only
-  source of truth: account state, decisions made, and reasoning for that run.
-- `LESSONS.md` — a short, curated, human-and-agent-readable list of observations the agent
-  has noticed across runs (e.g. "entries taken right at the edge of the pullback filter
-  tended to underperform"). This file is advisory only.
+| file | what |
+|------|------|
+| `strategy.py` | Decision engine. Stdlib only. Fetches its own 1H bars. |
+| `CLAUDE_ROUTINE_PROMPT.md` | Drop-in replacement for the old long Claude instructions prompt. |
+| `state.example.json` | Shape of the snapshot the routine must write before calling the script. |
 
-## Rules for the agent
+## Put `strategy.py` where the hourly job can see it
 
-- **Read** the last ~20 lines of `journal.jsonl` and all of `LESSONS.md` at the start of
-  every run, before evaluating anything, to have context on recent decisions and outcomes.
-- **Append** exactly one new line to `journal.jsonl` at the end of every run — never edit
-  or delete past lines. It is an immutable log.
-- **`LESSONS.md` may only be appended to, and only when a genuinely new, well-evidenced
-  observation emerges** (e.g. a repeated pattern across 3+ runs, or a clear postmortem on
-  a losing trade). Do not add speculative or single-data-point notes.
-- **The strategy's hard rules (EMA/ATR/position sizing/guardrails) are fixed by the human
-  operator and defined in the routine's own prompt.** This journal and its lessons are for
-  *context and observation only* — the agent must never use `LESSONS.md` to silently alter
-  entry/exit/sizing rules. If a lesson suggests a rule should change, say so explicitly in
-  the run summary so the human can review and decide — do not self-modify the strategy.
-- Always `git pull` before reading (in case of a race with a manual edit), and
-  `git add`, `commit`, `push` after appending. If push fails (e.g. non-fast-forward),
-  pull/rebase and retry once; if it still fails, note the failure in the run summary
-  rather than losing the entry.
+Copy `strategy.py` into the journal repo root (`crypto-ema-trend-journal`) so every scheduled run has it after `git checkout main`.
+
+```bash
+cp strategy.py /path/to/crypto-ema-trend-journal/strategy.py
+```
+
+Commit it once on `main`. After that the routine should not edit it.
+
+## What the Sonnet job does each hour
+
+1. Checkout `main`, read `journal.jsonl` + `LESSONS.md`.
+2. Pull account, activities, positions, open orders, latest quotes from the Alpaca MCP connector. **No bars.**
+3. Write `state.json` (see the example).
+4. Run:
+
+```bash
+python3 strategy.py --state state.json --out decisions.json
+```
+
+5. Execute `decisions.json` → `actions` in `seq` order via `place_crypto_order` / cancel / replace.
+6. Append `journal_entry` to `journal.jsonl`, commit, `git push origin HEAD:main`.
+
+## Optional env for bar fetch
+
+Crypto historical bars often work unauthenticated. If Alpaca starts requiring keys, export paper credentials:
+
+```bash
+export APCA_API_KEY_ID=...
+export APCA_API_SECRET_KEY=...
+```
+
+Bars are cached under `strategy.py`'s `.cache/` directory so a retry does not refetch.
+
+## Sanity check
+
+```bash
+python3 strategy.py --self-check
+```
+
+## Why this is cheaper / safer on Sonnet 5
+
+The old prompt forced the model to pull ~250–1000 bars per symbol through MCP and then re-emit them into a Python heredoc. That paid for every bar twice (tool input + model output) and put ~40 interacting branches on the model's back.
+
+Now the model sees a few dozen lines of account state plus a compact `decisions.json`. Adherence work remains (tool sequence, stop placement, journal push). Signal work does not.
