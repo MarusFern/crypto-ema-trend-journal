@@ -981,12 +981,17 @@ def evaluate(state: Dict[str, Any], indicators: Dict[str, Dict[str, Any]]) -> Di
 
         usable_cash = cash
         cash_capped = False
-        if usable_cash >= formulaic_notional:
+        # Always reserve CASH_BUFFER of available cash, even when cash comfortably
+        # covers the formulaic notional: Alpaca's actual execution requirement for a
+        # crypto market order runs a few percent above the naive qty*price notional
+        # (observed ~2% in production), so sizing right up to 100% of cash gets the
+        # order rejected for insufficient balance even though the math looked fine.
+        cash_ceiling = usable_cash * CASH_BUFFER
+        if cash_ceiling >= formulaic_notional:
             notional = formulaic_notional
             risk_pct = TARGET_RISK
         else:
-            reduced = usable_cash * CASH_BUFFER
-            risk_pct = (reduced * stop_pct) / equity if equity else 0.0
+            risk_pct = (cash_ceiling * stop_pct) / equity if equity else 0.0
             if risk_pct < MIN_RISK:
                 decisions[symbol] = {
                     "action": "skipped-cash-too-small",
@@ -996,7 +1001,7 @@ def evaluate(state: Dict[str, Any], indicators: Dict[str, Dict[str, Any]]) -> Di
                     ),
                 }
                 continue
-            notional = reduced
+            notional = cash_ceiling
             cash_capped = True
 
         # Total open-risk cap
