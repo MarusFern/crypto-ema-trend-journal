@@ -790,15 +790,42 @@ def evaluate(state: Dict[str, Any], indicators: Dict[str, Dict[str, Any]]) -> Di
                 add_action(kind="cancel_order", symbol=symbol, order_id=existing_tp_id, reason=why)
             canceled_resting = True
 
-        desired_stop = original_stop
+        # The resting stop is ground truth for this trade's risk; the
+        # reconstructed original stop (from avg fill + ATR-at-entry) is only a
+        # fallback when nothing is resting. Never let reconstruction TIGHTEN a
+        # live stop (2026-08-27: a reconstruction ~93 above the placed stop
+        # got a stop-out on a dip the placed stop would have survived).
+        desired_stop = working_stop_px if working_stop_px is not None else original_stop
         action_name = "held"
         reasons: List[str] = []
         fully_exited = False
         scaled_this_run = False
 
+        # Orphan remnant: the protective stop covers only the non-TP slice of
+        # the qty. If qty shrank, no stop is working, and price never reached
+        # TP1 since entry (so the reduction CANNOT have been a take-profit
+        # fill), the stop slice was sold at a loss between runs — the trade
+        # thesis is dead; flatten the remnant instead of re-staging it as a
+        # profitable scale-out.
+        if ws is None and scaled_out_pct > 0.05 and peak_r < TP1_R:
+            cancel_resting_sells("stop slice filled between runs; flattening orphan remnant")
+            add_action(
+                kind="market_sell",
+                symbol=symbol,
+                qty=qty,
+                reason=(
+                    f"orphan remnant after stop-slice fill: qty {qty} of original "
+                    f"{original_qty}, no working stop, peak_R={peak_r:.2f} < TP1 {TP1_R}"
+                ),
+            )
+            fully_exited = True
+            action_name = "exited"
+            blocked_reentry.add(symbol)
+            reasons.append(f"orphan-remnant-flatten peak_R={peak_r:.2f} scaled={scaled_out_pct:.0%}")
+
         # Stop already breached
         stop_ref = working_stop_px if working_stop_px is not None else original_stop
-        if price <= stop_ref:
+        if not fully_exited and price <= stop_ref:
             cancel_resting_sells("stop breached; flatten")
             add_action(
                 kind="market_sell",
@@ -930,14 +957,15 @@ def evaluate(state: Dict[str, Any], indicators: Dict[str, Dict[str, Any]]) -> Di
                             f"runner-trail min(EMA12={ema12_stop}, HH-{TRAIL_ATR_MULT}ATR={atr_stop})"
                         )
 
-            # Ordering matters: floor first (never loosen vs original/working),
-            # then cap below the live price (a stop_limit at/above market
-            # triggers immediately — even a reconstructed "original" stop can
-            # land above price when ATR-at-entry is off), and finally never
-            # lower an already-resting stop.
-            desired_stop = max(desired_stop, original_stop)
-            if working_stop_px is not None:
-                desired_stop = max(desired_stop, working_stop_px)
+            # Ordering matters: floor first (never loosen vs the resting stop,
+            # or vs the reconstructed original when nothing rests), then cap
+            # below the live price (a stop_limit at/above market triggers
+            # immediately — even a reconstructed "original" stop can land above
+            # price when ATR-at-entry is off), and finally never lower an
+            # already-resting stop. The reconstructed original is deliberately
+            # NOT a floor while a stop rests — that would tighten it.
+            floor_stop = working_stop_px if working_stop_px is not None else original_stop
+            desired_stop = max(desired_stop, floor_stop)
             if ind.get("atr14") and price:
                 cap_px = price - STOP_PRICE_GUARD_ATR * ind["atr14"]
                 if desired_stop > cap_px:
@@ -1565,6 +1593,19 @@ def self_check() -> int:
     res_e = build_result(state_e, CACHE_DIR_DEFAULT, fetch=False)
     d_e = res_e["decisions"]["BTC/USD"]
     assert d_e["action"] == "exited" and "giveback" in d_e["reason"], d_e
+
+    # Case F: orphan remnant — stop slice filled between runs (qty shrank, no
+    # working stop, price never reached TP1) -> flatten the remnant
+    entry_f = last + 0.5 * (1.5 * atr)  # underwater, peak_r < TP1_R
+    state_f = json.loads(json.dumps(state_d))
+    state_f["positions"][0]["avg_entry_price"] = entry_f
+    state_f["positions"][0]["qty"] = 0.02
+    state_f["positions"][0]["original_qty"] = 0.05
+    state_f["positions"][0]["scaled_out_pct"] = None
+    state_f["open_orders"] = []
+    res_f = build_result(state_f, CACHE_DIR_DEFAULT, fetch=False)
+    d_f = res_f["decisions"]["BTC/USD"]
+    assert d_f["action"] == "exited" and "orphan" in d_f["reason"], d_f
 
     print("self-check passed")
     print("  A BTC decision:", res_a["decisions"]["BTC/USD"]["action"])
