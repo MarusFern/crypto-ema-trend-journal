@@ -41,24 +41,48 @@ TARGET_BARS = 1000
 ATR_PERIOD = 14
 DUST_ABS = 1.0
 DUST_EQUITY_FRAC = 0.0001  # 0.01% of equity
-MAX_ENTRIES_PER_DAY = 3
+MAX_ENTRIES_PER_DAY = 4
 MAX_OPEN_POSITIONS = 2
 DAILY_PNL_HALT = -0.03
-TARGET_RISK = 0.01
+TARGET_RISK = 0.015
 MIN_RISK = 0.004
-MAX_TOTAL_RISK = 0.02
+MAX_TOTAL_RISK = 0.03
 CASH_BUFFER = 0.90
 STOP_ATR_MULT = 1.5
 STOP_PCT_CAP = 0.06
 CHASE_MULT = 1.015
 CONTINUATION_ATR_MULT = 0.15
-SCALE_1R = 1.0
-SCALE_3R = 3.0
-BE_OFFSET_R = 0.1
-TRAIL_ATR_MULT = 1.25
-STAGNATION_HOURS = 36
-STAGNATION_PEAK_R = 1.0
-STAGNATION_CUR_R = 0.5
+
+# --- Aggressive profit-taking ladder ---
+# Triggers key off PEAK R since entry (highest high, incl. the forming bar),
+# not just the live price at the run boundary, so an intra-hour spike through
+# a target still banks profit on the next check even after price retraces
+# (see LESSONS.md 2026-08-26: +2R spike round-tripped to -1.05R).
+TP1_R = 0.75            # first partial target
+TP1_FRAC = 0.40         # fraction of ORIGINAL qty sold at TP1
+TP2_R = 1.5             # second partial target
+TP2_FRAC_OF_REM = 0.50  # fraction of the remainder sold at TP2
+TP1_GATE = 0.35         # scaled_out_pct below this => TP1 stage still pending
+TP2_GATE = 0.65         # scaled_out_pct below this => TP2 stage still pending
+TRAIL_ATR_MULT = 1.0    # chandelier distance for the runner
+# Ratchet: once peak R reaches [0], the stop locks to entry + [1]*R (never lowered)
+LOCK_LADDER = (
+    (0.5, -0.4),
+    (0.75, 0.0),
+    (1.0, 0.1),
+    (1.5, 0.5),
+    (2.0, 1.0),
+    (3.0, 2.0),
+    (4.0, 3.0),
+)
+STOP_PRICE_GUARD_ATR = 0.25  # never raise a stop closer than this to live price
+# Giveback guard: once a trade has shown >= GIVEBACK_PEAK_R and price has
+# retraced to <= GIVEBACK_KEEP_FRAC of that peak, flatten the remainder.
+GIVEBACK_PEAK_R = 1.0
+GIVEBACK_KEEP_FRAC = 0.40
+STAGNATION_HOURS = 24
+STAGNATION_PEAK_R = 0.75
+STAGNATION_CUR_R = 0.4
 EMA200_JUMP_WARN = 0.02
 BARS_STALE_HOURS = 2.0
 
@@ -364,6 +388,15 @@ def highest_high_since(closed_bars: List[Dict[str, Any]], forming: Optional[Dict
 
 def original_stop_distance(entry_price: float, atr_at_entry: float) -> float:
     return min(STOP_ATR_MULT * atr_at_entry, entry_price * STOP_PCT_CAP)
+
+
+def ratchet_lock_r(peak_r: float) -> Optional[float]:
+    """Highest LOCK_LADDER stop level (in R vs entry) unlocked by peak R."""
+    lock = None
+    for thresh, lock_level in LOCK_LADDER:
+        if peak_r >= thresh:
+            lock = lock_level
+    return lock
 
 
 # ---------------------------------------------------------------------------
@@ -727,6 +760,36 @@ def evaluate(state: Dict[str, Any], indicators: Dict[str, Dict[str, Any]]) -> Di
                 reason="duplicate protective stop",
             )
 
+        # Resting take-profit bookkeeping up front, so cancels can always be
+        # sequenced AHEAD of market sells — Alpaca crypto reserves the full
+        # balance behind resting sells, so a market sell while stop+TP rest
+        # would be rejected for insufficient balance (LESSONS.md 2026-08-27).
+        existing_tp = resting_tp_for(symbol, open_orders)
+        existing_tp_id = (
+            str(existing_tp.get("id") or existing_tp.get("order_id") or "")
+            if existing_tp
+            else None
+        )
+        for dup in extra_tps(symbol, open_orders, existing_tp_id):
+            add_action(
+                kind="cancel_order",
+                symbol=symbol,
+                order_id=str(dup.get("id") or dup.get("order_id") or ""),
+                reason="duplicate resting take-profit",
+            )
+
+        canceled_resting = False
+
+        def cancel_resting_sells(why: str) -> None:
+            nonlocal canceled_resting
+            if canceled_resting:
+                return
+            if working_stop_id:
+                add_action(kind="cancel_order", symbol=symbol, order_id=working_stop_id, reason=why)
+            if existing_tp_id:
+                add_action(kind="cancel_order", symbol=symbol, order_id=existing_tp_id, reason=why)
+            canceled_resting = True
+
         desired_stop = original_stop
         action_name = "held"
         reasons: List[str] = []
@@ -736,8 +799,7 @@ def evaluate(state: Dict[str, Any], indicators: Dict[str, Dict[str, Any]]) -> Di
         # Stop already breached
         stop_ref = working_stop_px if working_stop_px is not None else original_stop
         if price <= stop_ref:
-            if working_stop_id:
-                add_action(kind="cancel_order", symbol=symbol, order_id=working_stop_id, reason="stop breached; flatten")
+            cancel_resting_sells("stop breached; flatten")
             add_action(
                 kind="market_sell",
                 symbol=symbol,
@@ -750,6 +812,10 @@ def evaluate(state: Dict[str, Any], indicators: Dict[str, Dict[str, Any]]) -> Di
 
         # Structural exits
         if not fully_exited:
+            giveback = (
+                peak_r >= GIVEBACK_PEAK_R
+                and r_mult <= GIVEBACK_KEEP_FRAC * peak_r
+            )
             stag = (
                 hours_open is not None
                 and hours_open >= STAGNATION_HOURS
@@ -757,16 +823,14 @@ def evaluate(state: Dict[str, Any], indicators: Dict[str, Dict[str, Any]]) -> Di
                 and r_mult < STAGNATION_CUR_R
             )
             if ind.get("fresh_cross_down"):
-                if working_stop_id:
-                    add_action(kind="cancel_order", symbol=symbol, order_id=working_stop_id, reason="EMA20/50 cross-down flatten")
+                cancel_resting_sells("EMA20/50 cross-down flatten")
                 add_action(kind="market_sell", symbol=symbol, qty=qty, reason="EMA20 crossed below EMA50 on last closed bar")
                 fully_exited = True
                 action_name = "exited"
                 blocked_reentry.add(symbol)
                 reasons.append("EMA20/50 cross-down")
             elif ind.get("close_lt_ema200"):
-                if working_stop_id:
-                    add_action(kind="cancel_order", symbol=symbol, order_id=working_stop_id, reason="close < EMA200 flatten")
+                cancel_resting_sells("close < EMA200 flatten")
                 add_action(
                     kind="market_sell",
                     symbol=symbol,
@@ -776,9 +840,23 @@ def evaluate(state: Dict[str, Any], indicators: Dict[str, Dict[str, Any]]) -> Di
                 fully_exited = True
                 action_name = "exited"
                 reasons.append("close < EMA200")
+            elif giveback:
+                cancel_resting_sells("giveback guard flatten")
+                add_action(
+                    kind="market_sell",
+                    symbol=symbol,
+                    qty=qty,
+                    reason=(
+                        f"giveback guard: peak_R={peak_r:.2f} retraced to "
+                        f"current_R={r_mult:.2f} (<= {GIVEBACK_KEEP_FRAC:.0%} of peak)"
+                    ),
+                )
+                fully_exited = True
+                action_name = "exited"
+                blocked_reentry.add(symbol)
+                reasons.append(f"giveback-guard peak_R={peak_r:.2f} current_R={r_mult:.2f}")
             elif stag:
-                if working_stop_id:
-                    add_action(kind="cancel_order", symbol=symbol, order_id=working_stop_id, reason="stagnation flatten")
+                cancel_resting_sells("stagnation flatten")
                 add_action(
                     kind="market_sell",
                     symbol=symbol,
@@ -794,189 +872,165 @@ def evaluate(state: Dict[str, Any], indicators: Dict[str, Dict[str, Any]]) -> Di
 
         remaining_qty = 0.0 if fully_exited else qty
 
-        if fully_exited:
-            stale_tp = resting_tp_for(symbol, open_orders)
-            if stale_tp is not None:
+        # Scaling / stop / TP management (only if still open)
+        if not fully_exited:
+            qty_tol = 10 ** (-QTY_PRECISION.get(symbol, 6))
+            price_tol = 10 ** (-PRICE_PRECISION.get(symbol, 2))
+
+            # ----- Profit ladder, keyed off PEAK R since entry -----
+            # peak_r uses the highest high (incl. the forming bar), so a spike
+            # through a target that retraced before this run still scales out now.
+            target_scaled = 0.0
+            if peak_r >= TP1_R:
+                target_scaled = TP1_FRAC
+            if peak_r >= TP2_R:
+                target_scaled = TP1_FRAC + TP2_FRAC_OF_REM * (1.0 - TP1_FRAC)
+            if target_scaled > scaled_out_pct + 1e-9 and remaining_qty > 0:
+                sell_qty = floor_qty(
+                    min(original_qty * (target_scaled - scaled_out_pct), remaining_qty),
+                    symbol,
+                )
+                if sell_qty > qty_tol:
+                    cancel_resting_sells("clearing resting sells ahead of ladder scale-out")
+                    add_action(
+                        kind="market_sell",
+                        symbol=symbol,
+                        qty=sell_qty,
+                        reason=(
+                            f"profit ladder: peak_R={peak_r:.2f} live_R={r_mult:.2f} "
+                            f"-> scaled out to {target_scaled:.0%}"
+                        ),
+                    )
+                    remaining_qty = floor_qty(remaining_qty - sell_qty, symbol)
+                    scaled_out_pct = (
+                        1.0 - (remaining_qty / original_qty) if original_qty else target_scaled
+                    )
+                    scaled_this_run = True
+                    action_name = "scaled"
+                    reasons.append(f"ladder-scale to {scaled_out_pct:.0%} at peak_R={peak_r:.2f}")
+
+            # ----- Ratchet stop: lock in profit as peak R climbs -----
+            lock_r = ratchet_lock_r(peak_r)
+            if lock_r is not None:
+                lock_px = entry + lock_r * original_r
+                if lock_px > desired_stop:
+                    desired_stop = lock_px
+                    reasons.append(f"ratchet-lock stop=entry{lock_r:+.1f}R (peak_R={peak_r:.2f})")
+
+            # ----- Runner trail once the TP2 stage is done -----
+            if remaining_qty > 0 and (scaled_out_pct >= TP2_GATE or peak_r >= TP2_R):
+                ema12_stop = ind.get("ema12")
+                atr_stop = (hh - TRAIL_ATR_MULT * ind["atr14"]) if (hh and ind.get("atr14")) else None
+                trail_candidates = [c for c in (ema12_stop, atr_stop) if c is not None]
+                if trail_candidates:
+                    trail_px = min(trail_candidates)
+                    if trail_px > desired_stop:
+                        desired_stop = trail_px
+                        reasons.append(
+                            f"runner-trail min(EMA12={ema12_stop}, HH-{TRAIL_ATR_MULT}ATR={atr_stop})"
+                        )
+
+            # Ordering matters: floor first (never loosen vs original/working),
+            # then cap below the live price (a stop_limit at/above market
+            # triggers immediately — even a reconstructed "original" stop can
+            # land above price when ATR-at-entry is off), and finally never
+            # lower an already-resting stop.
+            desired_stop = max(desired_stop, original_stop)
+            if working_stop_px is not None:
+                desired_stop = max(desired_stop, working_stop_px)
+            if ind.get("atr14") and price:
+                cap_px = price - STOP_PRICE_GUARD_ATR * ind["atr14"]
+                if desired_stop > cap_px:
+                    desired_stop = cap_px
+                    reasons.append("stop-capped-below-live-price")
+            if working_stop_px is not None and desired_stop < working_stop_px:
+                desired_stop = working_stop_px
+            desired_stop = round_price(desired_stop, symbol)
+
+            # ----- Desired resting take-profit for the current ladder stage -----
+            desired_tp_qty = 0.0
+            desired_tp_price = None
+            tp_reason = None
+            if remaining_qty > 0:
+                if scaled_out_pct < TP1_GATE:
+                    desired_tp_qty = floor_qty(min(original_qty * TP1_FRAC, remaining_qty), symbol)
+                    desired_tp_price = round_price(entry + TP1_R * original_r, symbol)
+                    tp_reason = f"TP1 resting @ entry+{TP1_R:.2f}R"
+                elif scaled_out_pct < TP2_GATE:
+                    desired_tp_qty = floor_qty(remaining_qty * TP2_FRAC_OF_REM, symbol)
+                    desired_tp_price = round_price(entry + TP2_R * original_r, symbol)
+                    tp_reason = f"TP2 resting @ entry+{TP2_R:.2f}R"
+                # else: final runner rides the trailing stop only, no resting TP.
+
+            # ----- Reconcile resting orders -----
+            # Alpaca crypto reserves the full balance behind resting sells, so
+            # the stop and the TP must SPLIT the remaining qty — they can never
+            # jointly exceed it (LESSONS.md 2026-08-27 09:57). Sequence matters:
+            # cancel/shrink first, place the TP last, so the reserved qty never
+            # exceeds the balance mid-reconcile.
+            tp_resting = None if canceled_resting else existing_tp
+            stop_resting_id = None if canceled_resting else working_stop_id
+            stop_resting_px = None if canceled_resting else working_stop_px
+
+            tp_stale = False
+            if tp_resting is not None:
+                ex_qty = float(tp_resting.get("qty") or tp_resting.get("filled_qty") or 0.0)
+                ex_price = float(tp_resting.get("limit_price") or 0.0)
+                if desired_tp_qty <= qty_tol or desired_tp_price is None:
+                    tp_stale = True
+                elif abs(ex_qty - desired_tp_qty) > qty_tol or abs(ex_price - desired_tp_price) > price_tol:
+                    tp_stale = True
+            if tp_resting is not None and tp_stale:
                 add_action(
                     kind="cancel_order",
                     symbol=symbol,
-                    order_id=str(stale_tp.get("id") or stale_tp.get("order_id") or ""),
-                    reason="position flattened; canceling resting take-profit",
+                    order_id=str(tp_resting.get("id") or tp_resting.get("order_id") or ""),
+                    reason="resting take-profit stale for current ladder stage",
                 )
-
-        # Scaling (only if still open)
-        if not fully_exited:
-            # +1R first scale
-            if r_mult >= SCALE_1R and scaled_out_pct < 0.45:
-                sell_qty = floor_qty(remaining_qty * 0.50, symbol)
-                if sell_qty > 0:
-                    add_action(
-                        kind="market_sell",
-                        symbol=symbol,
-                        qty=sell_qty,
-                        reason=f"scale 50% at +{r_mult:.2f}R",
-                    )
-                    remaining_qty = floor_qty(remaining_qty - sell_qty, symbol)
-                    scaled_out_pct = 1.0 - (remaining_qty / original_qty if original_qty else 0.5)
-                    scaled_this_run = True
-                    action_name = "scaled"
-                    reasons.append(f"scaled-50%-at-1R remaining={remaining_qty}")
-                    desired_stop = entry + BE_OFFSET_R * original_r
-
-            # +3R second scale
-            if remaining_qty > 0 and r_mult >= SCALE_3R and scaled_out_pct < 0.70:
-                sell_qty = floor_qty(remaining_qty * 0.50, symbol)
-                if sell_qty > 0:
-                    add_action(
-                        kind="market_sell",
-                        symbol=symbol,
-                        qty=sell_qty,
-                        reason=f"scale 50% of remainder at +{r_mult:.2f}R",
-                    )
-                    remaining_qty = floor_qty(remaining_qty - sell_qty, symbol)
-                    scaled_out_pct = 1.0 - (remaining_qty / original_qty if original_qty else 0.25)
-                    scaled_this_run = True
-                    action_name = "scaled"
-                    reasons.append(f"scaled-50%-of-remainder-at-3R remaining={remaining_qty}")
-
-            # Trail — gated on scaled_out_pct (reflects actual fills, including a resting
-            # take-profit filled between hourly checks) rather than only the live r_mult
-            # this run, so a price pullback after a TP fill doesn't leave the stop
-            # stranded at the wide original level. r_mult stays as an OR-fallback in case
-            # price blows through a threshold before the corresponding TP is confirmed.
-            if remaining_qty > 0 and (scaled_out_pct >= 0.45 or r_mult >= SCALE_1R):
-                if scaled_out_pct >= 0.70 or r_mult >= SCALE_3R:
-                    ema12_stop = ind.get("ema12")
-                    atr_stop = (hh - TRAIL_ATR_MULT * ind["atr14"]) if (hh and ind.get("atr14")) else None
-                    trail_candidates = [c for c in (ema12_stop, atr_stop) if c is not None]
-                    if trail_candidates:
-                        desired_stop = min(trail_candidates)
-                        reasons.append(
-                            f"tight-trail min(EMA12={ema12_stop}, HH-1.25ATR={atr_stop})"
-                        )
-                else:
-                    desired_stop = max(desired_stop, entry + BE_OFFSET_R * original_r)
-                    reasons.append(f"BE trail entry+0.1R={desired_stop:.2f}")
-
-            # Never move a stop down vs original or vs working
-            floor_stop = original_stop
-            if working_stop_px is not None:
-                floor_stop = max(floor_stop, working_stop_px)
-            if desired_stop < floor_stop:
-                desired_stop = floor_stop
-            desired_stop = round_price(desired_stop, symbol)
+                tp_resting = None
+                reasons.append("cleared-stale-tp")
 
             if remaining_qty > 0:
-                if working_stop_id is None:
-                    add_action(
-                        kind="place_stop",
-                        symbol=symbol,
-                        side="sell",
-                        qty=remaining_qty,
-                        stop_price=desired_stop,
-                        reason="no protective stop working; placing one",
+                stop_qty = floor_qty(max(remaining_qty - desired_tp_qty, 0.0), symbol)
+                if stop_resting_id is None:
+                    if stop_qty > qty_tol:
+                        add_action(
+                            kind="place_stop",
+                            symbol=symbol,
+                            side="sell",
+                            qty=stop_qty,
+                            stop_price=desired_stop,
+                            reason="placing protective stop for the non-TP remainder",
+                        )
+                        reasons.append(f"placed-stop@{desired_stop}")
+                else:
+                    ws_qty = float(ws.get("qty") or ws.get("filled_qty") or 0.0) if ws else 0.0
+                    price_raise = (
+                        stop_resting_px is not None
+                        and desired_stop - stop_resting_px >= price_tol
                     )
-                    action_name = "scaled" if scaled_this_run else "held"
-                    reasons.append(f"placed-stop@{desired_stop}")
-                elif abs(desired_stop - (working_stop_px or 0.0)) >= 10 ** (-PRICE_PRECISION.get(symbol, 2)):
-                    if desired_stop > (working_stop_px or 0.0):
+                    qty_mismatch = abs(ws_qty - stop_qty) > qty_tol
+                    if price_raise or qty_mismatch:
                         add_action(
                             kind="replace_stop",
                             symbol=symbol,
-                            order_id=working_stop_id,
-                            qty=remaining_qty,
+                            order_id=stop_resting_id,
+                            qty=stop_qty,
                             stop_price=desired_stop,
-                            reason=f"trail stop {working_stop_px} -> {desired_stop}",
+                            reason=f"stop {stop_resting_px} qty {ws_qty} -> {desired_stop} qty {stop_qty}",
                         )
-                        reasons.append(f"raised-stop {working_stop_px}->{desired_stop}")
-                    else:
-                        # quantity mismatch only
-                        ws_qty = float(ws.get("qty") or ws.get("filled_qty") or 0.0) if ws else 0.0
-                        if abs(ws_qty - remaining_qty) > 10 ** (-QTY_PRECISION.get(symbol, 6)):
-                            add_action(
-                                kind="replace_stop",
-                                symbol=symbol,
-                                order_id=working_stop_id,
-                                qty=remaining_qty,
-                                stop_price=working_stop_px,
-                                reason="resize stop qty to remaining position",
-                            )
-                            reasons.append("resized-stop-qty")
+                        reasons.append(f"stop->{desired_stop}x{stop_qty}")
 
-            # ----- Resting take-profit limit order (fills between hourly checks) -----
-            # This is additive, not a replacement: the +1R/+3R market_sell scaling above
-            # stays as the guaranteed hourly-cadence safety net. The resting limit order
-            # is the fast path — it can fill on an intra-hour spike that reverses before
-            # the next check would otherwise have caught it (see LESSONS.md 2026-08-26).
-            # A stop (stop_price set) and a take-profit (plain limit, no stop_price) are
-            # never confused: resting_tp_for only matches the latter shape.
-            if remaining_qty > 0:
-                existing_tp = resting_tp_for(symbol, open_orders)
-                dup_tps = extra_tps(
-                    symbol, open_orders,
-                    str(existing_tp.get("id") or existing_tp.get("order_id") or "") if existing_tp else None,
-                )
-                for dup in dup_tps:
+                if desired_tp_qty > qty_tol and desired_tp_price is not None and tp_resting is None:
                     add_action(
-                        kind="cancel_order",
+                        kind="place_take_profit",
                         symbol=symbol,
-                        order_id=str(dup.get("id") or dup.get("order_id") or ""),
-                        reason="duplicate resting take-profit",
+                        side="sell",
+                        qty=desired_tp_qty,
+                        limit_price=desired_tp_price,
+                        reason=tp_reason,
                     )
-
-                desired_tp_qty = None
-                desired_tp_price = None
-                tp_reason = None
-                if scaled_out_pct < 0.45:
-                    desired_tp_qty = floor_qty(min(original_qty * 0.50, remaining_qty), symbol)
-                    desired_tp_price = round_price(entry + SCALE_1R * original_r, symbol)
-                    tp_reason = f"TP1 resting @ entry+{SCALE_1R:.1f}R"
-                elif scaled_out_pct < 0.70:
-                    desired_tp_qty = floor_qty(remaining_qty * 0.50, symbol)
-                    desired_tp_price = round_price(entry + SCALE_3R * original_r, symbol)
-                    tp_reason = f"TP2 resting @ entry+{SCALE_3R:.1f}R"
-                # else: final runner rides the trailing stop only, no further resting TP.
-
-                price_tol = 10 ** (-PRICE_PRECISION.get(symbol, 2))
-                qty_tol = 10 ** (-QTY_PRECISION.get(symbol, 6))
-                if desired_tp_qty and desired_tp_qty > 0:
-                    if existing_tp is None:
-                        add_action(
-                            kind="place_take_profit",
-                            symbol=symbol,
-                            side="sell",
-                            qty=desired_tp_qty,
-                            limit_price=desired_tp_price,
-                            reason=tp_reason,
-                        )
-                        reasons.append(f"placed-tp@{desired_tp_price}")
-                    else:
-                        ex_qty = float(existing_tp.get("qty") or existing_tp.get("filled_qty") or 0.0)
-                        ex_price = float(existing_tp.get("limit_price") or 0.0)
-                        if abs(ex_qty - desired_tp_qty) > qty_tol or abs(ex_price - desired_tp_price) > price_tol:
-                            add_action(
-                                kind="cancel_order",
-                                symbol=symbol,
-                                order_id=str(existing_tp.get("id") or existing_tp.get("order_id") or ""),
-                                reason="resting TP stale (qty/price changed); replacing",
-                            )
-                            add_action(
-                                kind="place_take_profit",
-                                symbol=symbol,
-                                side="sell",
-                                qty=desired_tp_qty,
-                                limit_price=desired_tp_price,
-                                reason=tp_reason,
-                            )
-                            reasons.append(f"replaced-tp@{desired_tp_price}")
-                elif existing_tp is not None:
-                    add_action(
-                        kind="cancel_order",
-                        symbol=symbol,
-                        order_id=str(existing_tp.get("id") or existing_tp.get("order_id") or ""),
-                        reason="no active TP target (final runner); canceling stale resting take-profit",
-                    )
-                    reasons.append("cleared-stale-tp")
+                    reasons.append(f"tp@{desired_tp_price}")
 
         unrealized_pct = None
         if entry:
@@ -1051,10 +1105,12 @@ def evaluate(state: Dict[str, Any], indicators: Dict[str, Dict[str, Any]]) -> Di
             }
             continue
         if symbol in blocked_reentry:
-            decisions[symbol] = {
-                "action": "blocked-by-guardrail",
-                "reason": "same-run re-entry blocked after EMA20/50 cross-down exit",
-            }
+            note = "same-run re-entry blocked after trend-failure exit (cross-down/giveback)"
+            if symbol in decisions:
+                # keep the 'exited' decision visible in the journal
+                decisions[symbol]["reason"] += "; " + note
+            else:
+                decisions[symbol] = {"action": "blocked-by-guardrail", "reason": note}
             continue
         if symbol in loss_exits_today:
             decisions[symbol] = {
@@ -1192,23 +1248,30 @@ def evaluate(state: Dict[str, Any], indicators: Dict[str, Dict[str, Any]]) -> Di
                 + (" cash-capped" if cash_capped else "")
             ),
         )
+        # The stop and TP1 SPLIT the position qty: Alpaca crypto reserves the
+        # full balance behind resting sells, so a full-qty stop plus a TP would
+        # be rejected (LESSONS.md 2026-08-27 09:57). The hourly stop-breach
+        # check backstops the TP1 slice if price crashes intra-hour.
+        tp1_qty = floor_qty(qty * TP1_FRAC, symbol)
+        stop_qty = floor_qty(qty - tp1_qty, symbol)
+        if tp1_qty <= 0:
+            stop_qty = qty
         add_action(
             kind="place_stop",
             symbol=symbol,
             side="sell",
-            qty=qty,
+            qty=stop_qty,
             stop_price=stop_px,
-            reason=f"initial stop {stop_px} (dist={stop_dist:.2f}, {stop_pct:.2%})",
+            reason=f"initial stop {stop_px} (dist={stop_dist:.2f}, {stop_pct:.2%}); covers non-TP remainder",
         )
-        tp1_qty = floor_qty(qty * 0.50, symbol)
         if tp1_qty > 0:
             add_action(
                 kind="place_take_profit",
                 symbol=symbol,
                 side="sell",
                 qty=tp1_qty,
-                limit_price=round_price(price + SCALE_1R * stop_dist, symbol),
-                reason=f"initial TP1 resting @ entry+{SCALE_1R:.1f}R (fills between hourly checks)",
+                limit_price=round_price(price + TP1_R * stop_dist, symbol),
+                reason=f"TP1 resting @ entry+{TP1_R:.2f}R (fills between hourly checks; splits qty with the stop)",
             )
 
         decisions[symbol] = {
@@ -1484,12 +1547,31 @@ def self_check() -> int:
     kinds = [a["kind"] for a in res_d["actions"] if a.get("symbol") == "BTC/USD"]
     assert "market_sell" in kinds, res_d["actions"]
     assert res_d["decisions"]["BTC/USD"]["action"] in {"scaled", "exited"}
+    # A market sell must never fire while resting sells still hold the balance:
+    # the stop cancel has to come first.
+    cancel_idx = kinds.index("cancel_order")
+    sell_idx = kinds.index("market_sell")
+    assert cancel_idx < sell_idx, kinds
+
+    # Case E: giveback guard — spiked to ~2R intra-hour, retraced to ~0.3R -> flatten
+    stop_dist_e = 1.5 * atr
+    entry_e = last - 0.3 * stop_dist_e
+    bars_e = json.loads(json.dumps(bars))
+    bars_e[-5]["h"] = entry_e + 2.0 * stop_dist_e
+    state_e = json.loads(json.dumps(state_d))
+    state_e["positions"][0]["avg_entry_price"] = entry_e
+    state_e["open_orders"][0]["stop_price"] = entry_e - stop_dist_e
+    state_e["bars"]["BTC/USD"] = bars_e
+    res_e = build_result(state_e, CACHE_DIR_DEFAULT, fetch=False)
+    d_e = res_e["decisions"]["BTC/USD"]
+    assert d_e["action"] == "exited" and "giveback" in d_e["reason"], d_e
 
     print("self-check passed")
     print("  A BTC decision:", res_a["decisions"]["BTC/USD"]["action"])
     print("  B chase:", res_b["decisions"]["BTC/USD"]["action"])
     print("  C halt:", res_c["decisions"]["BTC/USD"]["action"])
     print("  D BTC:", res_d["decisions"]["BTC/USD"]["action"], "actions", kinds)
+    print("  E giveback:", d_e["action"], "|", d_e["reason"][:100])
     return 0
 
 

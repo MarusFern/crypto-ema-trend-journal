@@ -48,6 +48,26 @@ export APCA_API_SECRET_KEY=...
 
 Bars are cached under `strategy.py`'s `.cache/` directory so a retry does not refetch.
 
+## Profit-taking model (aggressive, since 2026-08-27)
+
+Exits are deliberately faster than the entries:
+
+- **Ladder keyed off PEAK R** (highest high since entry, incl. the forming bar):
+  TP1 sells 40% at +0.75R, TP2 sells half the remainder at +1.5R. A spike
+  through a target that retraces before the hourly check still scales out.
+- **Resting TP limit orders** at the ladder prices fill between hourly checks.
+  The stop and the TP *split* the position qty — Alpaca crypto reserves the
+  full balance behind resting sells, so they can never jointly exceed it.
+- **Ratcheting stop locks** as peak R climbs: ≥0.5R → entry−0.4R, ≥0.75R → BE,
+  ≥1.5R → +0.5R, ≥2R → +1R, ≥3R → +2R. Runner trails min(EMA12, HH−1.0·ATR)
+  after the TP2 stage. Stops only ever move up, and never within 0.25·ATR of
+  the live price.
+- **Giveback guard**: once a trade has shown ≥1R, retracing to ≤40% of peak
+  flattens the remainder immediately (no more +2R → −1R round trips).
+- **Stagnation exit** at 24h if peak < 0.75R and current < 0.4R.
+- Sizing: 1.5% risk per entry, 3% total open risk, 4 entries/day,
+  −3% daily P&L halt, 90% cash buffer unchanged.
+
 ## Sanity check
 
 ```bash
